@@ -91,12 +91,255 @@ def fit_longterm_avg_model(train_df):
     """Return the mean streamflow (cfs) over the entire training period."""
     return float(train_df['streamflow_cfs'].mean())
 
+def fit_monthly_avg_model(train_df):
+    """Return a dictionary mapping each calendar month (1-12) to the mean streamflow
+    for that month over the training period."""
+    return train_df.groupby(train_df.index.month)['streamflow_cfs'].mean().to_dict()
 
 def make_5day_forecast_longterm(mean_flow, forecast_date, n_days=5):
     """Return DataFrame with the long-term mean flow for every forecast day."""
     dates = pd.date_range(start=forecast_date, periods=n_days, freq='D')
     return pd.DataFrame({'Forecast_cfs': mean_flow}, index=dates)
 
+def make_5day_forecast_monthly(monthly_means, forecast_date, n_days=5):
+    """Return a DataFrame with Forecast_cfs indexed by date, where each day's forecast
+    is the historical mean for that day's calendar month. To look up the month for
+    a date d, use d.month."""
+    return pd.DataFrame({'Forecast_cfs': mean_flow}, index=dates)
+
+
+# ── Meteorological regression model ───────────────────────────────────────────
+
+def get_met_data_single_cell(date_start, date_end,
+                             lat=34.4483605, lon=-111.7898705,
+                             dataset="CW3E", grid="conus2"):
+    """
+    Download precipitation and air temperature from one gridded forcing cell
+    near the Verde River near Camp Verde gauge.
+
+    Precipitation is returned as daily total precipitation.
+    Air temperature is returned as daily average air temperature.
+
+    Notes:
+    - CW3E forcing is hourly.
+    - precipitation is treated as a rate, so daily precipitation is calculated
+      by summing hourly values * 3600 seconds/hour.
+    - air_temp is usually in Kelvin, but for regression the units are okay
+      as long as they are consistent.
+    """
+    start_ts = pd.Timestamp(date_start)
+    end_ts = pd.Timestamp(date_end)
+
+    # Convert the gauge latitude/longitude to HydroFrame grid indices.
+    grid_i, grid_j = hf_hydrodata.to_ij(grid, lat, lon)
+    grid_bounds = (grid_i, grid_j, grid_i + 1, grid_j + 1)
+
+    forcing = {}
+
+    for var in ["precipitation", "air_temp"]:
+        options = {
+            "dataset": dataset,
+            "dataset_version": "1.0",
+            "variable": var,
+            "temporal_resolution": "hourly",
+            "grid": grid,
+            "start_time": start_ts.strftime("%Y-%m-%d"),
+            # Add one day because HydroData end_time is effectively the end boundary
+            "end_time": (end_ts + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+            "grid_bounds": grid_bounds,
+        }
+
+        arr = hf_hydrodata.get_gridded_data(options).squeeze()
+        forcing[var] = np.asarray(arr).astype(float)
+
+    # Build an hourly time index matching the returned data length.
+    n_hours = min(len(forcing["precipitation"]), len(forcing["air_temp"]))
+    hourly_index = pd.date_range(start=start_ts, periods=n_hours, freq="h")
+
+    hourly = pd.DataFrame(
+        {
+            "precip_rate": forcing["precipitation"][:n_hours],
+            "air_temp": forcing["air_temp"][:n_hours],
+        },
+        index=hourly_index
+    )
+
+    # Convert hourly precipitation rate to a daily total.
+    # If the precipitation units are mm/s, this gives mm/hr before daily summing.
+    daily = pd.DataFrame()
+    daily["precip_1day"] = (hourly["precip_rate"] * 3600).resample("D").sum()
+    daily["air_temp_1day"] = hourly["air_temp"].resample("D").mean()
+
+    return daily
+
+
+def make_met_regression_features(flow_df, met_df):
+    """
+    Combine streamflow and meteorological data into regression features.
+
+    The target is today's log streamflow.
+    The predictors use only information from previous days.
+    """
+    df = flow_df[["streamflow_cfs", "log_flow"]].copy()
+    df = df.join(met_df, how="inner")
+
+    # Lagged streamflow features
+    df["flow_lag1"] = df["streamflow_cfs"].shift(1)
+    df["flow_7day_mean"] = df["streamflow_cfs"].shift(1).rolling(7).mean()
+
+    # Lagged meteorological features
+    df["precip_7day_sum"] = df["precip_1day"].shift(1).rolling(7).sum()
+    df["temp_7day_mean"] = df["air_temp_1day"].shift(1).rolling(7).mean()
+
+    # Seasonal timing features
+    day_of_year = df.index.dayofyear
+    df["sin_doy"] = np.sin(2 * np.pi * day_of_year / 365.25)
+    df["cos_doy"] = np.cos(2 * np.pi * day_of_year / 365.25)
+
+    df = df.dropna()
+
+    feature_cols = [
+        "flow_lag1",
+        "flow_7day_mean",
+        "precip_7day_sum",
+        "temp_7day_mean",
+        "sin_doy",
+        "cos_doy",
+    ]
+
+    X = df[feature_cols]
+    y = df["log_flow"]
+
+    return X, y, df
+
+
+def fit_met_regression_model(train_df, met_df):
+    """
+    Fit a simple linear regression model using numpy.
+
+    This avoids adding another package dependency. The model predicts log_flow,
+    then forecast values are converted back to cfs.
+    """
+    X, y, _ = make_met_regression_features(train_df, met_df)
+
+    feature_cols = list(X.columns)
+
+    # Standardize features so variables with large units do not dominate.
+    x_mean = X.mean()
+    x_std = X.std().replace(0, 1)
+
+    X_scaled = (X - x_mean) / x_std
+
+    # Add intercept column
+    X_design = np.column_stack([np.ones(len(X_scaled)), X_scaled.values])
+
+    # Least-squares regression
+    coef, _, _, _ = np.linalg.lstsq(X_design, y.values, rcond=None)
+
+    model = {
+        "model_type": "met_regression",
+        "feature_cols": feature_cols,
+        "x_mean": x_mean.to_dict(),
+        "x_std": x_std.to_dict(),
+        "coef": coef,
+    }
+
+    return model
+
+
+def predict_met_regression(model, X):
+    """
+    Predict streamflow in cfs from met_regression model features.
+    """
+    feature_cols = model["feature_cols"]
+
+    x_mean = pd.Series(model["x_mean"])
+    x_std = pd.Series(model["x_std"])
+
+    X_use = X[feature_cols]
+    X_scaled = (X_use - x_mean) / x_std
+
+    X_design = np.column_stack([np.ones(len(X_scaled)), X_scaled.values])
+    pred_log = X_design @ model["coef"]
+
+    # Convert log(flow + 1) back to flow
+    pred_cfs = np.exp(pred_log) - 1
+
+    # Avoid negative predictions caused by regression math
+    pred_cfs = np.maximum(pred_cfs, 0)
+
+    return pd.Series(pred_cfs, index=X.index)
+
+
+def validate_met_regression_model(model, train_df, test_df, met_df):
+    """
+    Create fitted values for train and predictions for test using observed
+    previous-day data. This is validation, not future forecasting.
+    """
+    combined = pd.concat([train_df, test_df]).sort_index()
+
+    X_all, _, _ = make_met_regression_features(combined, met_df)
+    pred_all = predict_met_regression(model, X_all)
+
+    train_pred = pred_all.loc[pred_all.index.intersection(train_df.index)]
+    test_pred = pred_all.loc[pred_all.index.intersection(test_df.index)]
+
+    test_obs = test_df.loc[test_pred.index, "streamflow_cfs"]
+
+    return train_pred, test_pred, test_obs
+
+
+def make_5day_forecast_met_regression(model, recent_flow_df, recent_met_df,
+                                      forecast_date, n_days=5):
+    """
+    Make a 5-day forecast using only data before the forecast date.
+
+    Since we are not using forecasted precipitation or temperature, the model
+    carries forward the most recent 7-day meteorological summary for all 5
+    forecast days. Streamflow is updated recursively using the previous
+    predicted flow.
+    """
+    forecast_dates = pd.date_range(start=forecast_date, periods=n_days, freq="D")
+
+    history = recent_flow_df[["streamflow_cfs"]].copy()
+    met_history = recent_met_df.copy()
+
+    forecasts = []
+
+    for date in forecast_dates:
+        # Use streamflow history available up to the day before this forecast date.
+        flow_lag1 = history["streamflow_cfs"].iloc[-1]
+        flow_7day_mean = history["streamflow_cfs"].iloc[-7:].mean()
+
+        # Use met data only from before the forecast date.
+        precip_7day_sum = met_history["precip_1day"].iloc[-7:].sum()
+        temp_7day_mean = met_history["air_temp_1day"].iloc[-7:].mean()
+
+        sin_doy = np.sin(2 * np.pi * date.dayofyear / 365.25)
+        cos_doy = np.cos(2 * np.pi * date.dayofyear / 365.25)
+
+        X = pd.DataFrame(
+            {
+                "flow_lag1": [flow_lag1],
+                "flow_7day_mean": [flow_7day_mean],
+                "precip_7day_sum": [precip_7day_sum],
+                "temp_7day_mean": [temp_7day_mean],
+                "sin_doy": [sin_doy],
+                "cos_doy": [cos_doy],
+            },
+            index=[date]
+        )
+
+        forecast_cfs = float(predict_met_regression(model, X).iloc[0])
+        forecasts.append(forecast_cfs)
+
+        # Add predicted flow to history so the next forecast day can use it.
+        history.loc[date, "streamflow_cfs"] = forecast_cfs
+
+        # Do NOT add future met data. This keeps the model from using future
+        # precipitation or temperature forecasts.
+
+    return pd.DataFrame({"Forecast_cfs": forecasts}, index=forecast_dates)
 
 def compute_metrics(observed_cfs, predicted_cfs):
     """Return dict with RMSE, R², and NSE (Nash-Sutcliffe Efficiency)."""
@@ -153,7 +396,7 @@ def plot_validation(train_cfs, test_cfs, forecast_cfs, metrics, model_label,
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"  Plot saved to {save_path}")
-    plt.show()
+    # plt.show()
 
 
 def save_model(model, path='saved_model.pkl'):
@@ -167,3 +410,44 @@ def load_model(path='saved_model.pkl'):
         model = pickle.load(f)
     print(f"  Model loaded from {path}")
     return model
+
+def fit_monthly_avg_model(train_df):
+    """
+    Fit a monthly-average model.
+
+    This groups the training data by month and calculates the mean streamflow
+    for each month of the year. The result is a dictionary like:
+    {1: January mean flow, 2: February mean flow, ...}
+    """
+    monthly_means = train_df.groupby(train_df.index.month)['streamflow_cfs'].mean().to_dict()
+    return monthly_means
+
+
+def make_5day_forecast_monthly(monthly_model, forecast_date, n_days=5):
+    """
+    Make a 5-day forecast using the average streamflow for each forecast month.
+    """
+    dates = pd.date_range(start=forecast_date, periods=n_days, freq='D')
+    forecasts = []
+
+    for date in dates:
+        month = date.month
+        forecast = monthly_model[month]
+        forecasts.append(forecast)
+
+    return pd.DataFrame({'Forecast_cfs': forecasts}, index=dates)
+
+
+def make_monthly_avg_predictions(monthly_model, dates):
+    """
+    Make monthly-average predictions for an existing set of dates.
+    This is useful for validation on the test period.
+    """
+    predictions = []
+
+    for date in dates:
+        month = date.month
+        prediction = monthly_model[month]
+        predictions.append(prediction)
+
+    return pd.Series(predictions, index=dates)

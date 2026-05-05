@@ -16,7 +16,7 @@ $TEST_END = "2024-12-31"
 $FORECAST_DATE = "2024-04-30"   # First day of the 5-day forecast
 $REFIT_MODEL = "True"           # True = re-fit from scratch | False = use saved_model.pkl
 $RUN_VALIDATION = "True"        # True = show validation plots and metrics
-$MODEL = "longterm_avg"         # longterm_avg = training mean
+$MODEL = "met_regression"       # options: longterm_avg, monthly_avg, met_regression
 
 # =============================================================================
 # RUN WORKFLOW — no need to edit below this line

@@ -1,0 +1,14 @@
+﻿name: hw7
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pandas
+  - numpy
+  - matplotlib
+  - scikit-learn
+  - ipykernel
+  - pip
+  - pip:
+      - hf_hydrodata

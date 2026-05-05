@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+saved_model.pkl
+forecast_plot.png
+validation_plot.png
+.ipynb_checkpoints/
+test.ipynb
