@@ -44,12 +44,18 @@ You may choose from three models:
 
 ## Running the workflow
 
-Open `run_workflow.ps1` and check the settings near the top of the file.
+For Mac, Linux, or GitHub Codespaces, run:
 
-In a PowerShell terminal, run:
+```bash
+bash run_workflow.sh
+```
+
+For Windows PowerShell, run:
 
 ```powershell
 .\run_workflow.ps1
 ```
+
+Both scripts use the same workflow settings: gauge ID, training dates, test dates, forecast date, model choice, refit option, and validation option.
 
 The script will ask for your HydroFrame email and PIN, then train the selected model and/or generate a forecast depending on the settings.
